@@ -1,0 +1,47 @@
+{
+  "name": "edge-secure-token",
+  "version": "0.1.0",
+  "description": "Zero-dependency, timing-safe WebCrypto JWT suite for Cloudflare Workers, Edge, and Node.js with field-level claims encryption.",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md",
+    "README_JA.md",
+    "SECURITY.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "pretest": "npm run build",
+    "test": "node --test test/*.test.mjs"
+  },
+  "keywords": [
+    "jwt",
+    "token",
+    "webcrypto",
+    "edge",
+    "cloudflare-workers",
+    "security",
+    "timing-safe",
+    "field-level-encryption",
+    "zero-dependencies"
+  ],
+  "author": "takao-dev",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0"
+  }
+}
