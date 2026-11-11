@@ -4,7 +4,12 @@ import {
   signToken,
   verifyToken,
   timingSafeEqual,
+  issueTokenPair,
+  rotateTokenPair,
+  MemoryRevocationStore,
 } from '../dist/index.js';
+
+const TEST_SECRET = 'super-secret-jwt-key-minimum-32-characters';
 
 test('timingSafeEqual detects equality and mismatch in constant-time', () => {
   const a = new Uint8Array([1, 2, 3, 4]);
@@ -17,12 +22,12 @@ test('timingSafeEqual detects equality and mismatch in constant-time', () => {
   assert.equal(timingSafeEqual(a, d), false);
 });
 
-test('signToken and verifyToken round-trip with HS256', async () => {
-  const secret = 'super-secret-jwt-key-minimum-32-characters';
+test('signToken and verifyToken round-trip with HS256 and JTI', async () => {
   const payload = { userId: 'u_1001', role: 'admin' };
 
-  const token = await signToken(payload, secret, {
+  const token = await signToken(payload, TEST_SECRET, {
     alg: 'HS256',
+    kid: 'key-primary-2026',
     issuer: 'https://auth.example.com',
     audience: 'https://api.example.com',
     expiresIn: 3600,
@@ -31,15 +36,86 @@ test('signToken and verifyToken round-trip with HS256', async () => {
   assert.ok(typeof token === 'string');
   assert.equal(token.split('.').length, 3);
 
-  const verified = await verifyToken(token, secret, {
+  const verified = await verifyToken(token, TEST_SECRET, {
     issuer: 'https://auth.example.com',
     audience: 'https://api.example.com',
   });
 
   assert.equal(verified.userId, 'u_1001');
   assert.equal(verified.role, 'admin');
+  assert.ok(typeof verified.jti === 'string');
   assert.equal(verified.iss, 'https://auth.example.com');
   assert.ok(verified.exp > Math.floor(Date.now() / 1000));
+});
+
+test('Key ID (kid) path traversal and injection attacks are structurally rejected', async () => {
+  const maliciousKids = [
+    '../../../../etc/passwd',
+    "key' OR '1'='1",
+    'key; DROP TABLE keys;--',
+    '<script>alert(1)</script>',
+    'key with spaces',
+  ];
+
+  for (const kid of maliciousKids) {
+    await assert.rejects(
+      () => signToken({ user: 'attacker' }, TEST_SECRET, { kid }),
+      /invalid key id \(kid\)/i
+    );
+  }
+});
+
+test('verifyToken strictly rejects "alg": "none" and all case variations', async () => {
+  const variations = ['none', 'None', 'nOnE', 'NONE'];
+
+  for (const alg of variations) {
+    const header = Buffer.from(JSON.stringify({ typ: 'JWT', alg })).toString('base64url');
+    const payload = Buffer.from(JSON.stringify({ role: 'admin' })).toString('base64url');
+    const noneToken = `${header}.${payload}.`;
+
+    await assert.rejects(
+      () => verifyToken(noneToken, TEST_SECRET),
+      /prohibited signature algorithm/i
+    );
+  }
+});
+
+test('Instant token revocation via RevocationStore invalidates active tokens', async () => {
+  const store = new MemoryRevocationStore();
+
+  const token = await signToken({ user: 'charlie' }, TEST_SECRET, { expiresIn: 3600 });
+  const verified = await verifyToken(token, TEST_SECRET, { revocationStore: store });
+  assert.equal(verified.user, 'charlie');
+
+  // Immediately revoke this token's JTI
+  store.revoke(verified.jti, verified.exp);
+
+  // Subsequent verification must fail closed
+  await assert.rejects(
+    () => verifyToken(token, TEST_SECRET, { revocationStore: store }),
+    /token has been revoked/i
+  );
+});
+
+test('Token Pair issuance, rotation, and replay-attack defense', async () => {
+  const store = new MemoryRevocationStore();
+
+  // 1. Issue pair
+  const pair1 = await issueTokenPair({ sub: 'user_42', tier: 'premium' }, TEST_SECRET);
+  assert.ok(pair1.accessToken);
+  assert.ok(pair1.refreshToken);
+
+  // 2. Rotate pair using valid refresh token
+  const pair2 = await rotateTokenPair(pair1.refreshToken, TEST_SECRET, store);
+  assert.ok(pair2.accessToken);
+  assert.ok(pair2.refreshToken);
+  assert.notEqual(pair1.accessToken, pair2.accessToken);
+
+  // 3. Replay attack: attempting to reuse old pair1.refreshToken MUST be rejected
+  await assert.rejects(
+    () => rotateTokenPair(pair1.refreshToken, TEST_SECRET, store),
+    /token has been revoked/i
+  );
 });
 
 test('signToken and verifyToken with ES256 (ECDSA)', async () => {
@@ -61,40 +137,26 @@ test('signToken and verifyToken with ES256 (ECDSA)', async () => {
 });
 
 test('verifyToken fails closed on tampered payload or signature', async () => {
-  const secret = 'super-secret-jwt-key-minimum-32-characters';
-  const token = await signToken({ account: 'acc_free' }, secret);
-
+  const token = await signToken({ account: 'acc_free' }, TEST_SECRET);
   const parts = token.split('.');
-  // Tamper with payload to escalate privileges
+
   const tamperedPayload = Buffer.from(JSON.stringify({ account: 'acc_admin' }))
     .toString('base64url');
   const tamperedToken = `${parts[0]}.${tamperedPayload}.${parts[2]}`;
 
   await assert.rejects(
-    () => verifyToken(tamperedToken, secret),
+    () => verifyToken(tamperedToken, TEST_SECRET),
     /invalid token signature/i
   );
 });
 
-test('verifyToken strictly rejects "alg": "none" attacks', async () => {
-  const header = Buffer.from(JSON.stringify({ typ: 'JWT', alg: 'none' })).toString('base64url');
-  const payload = Buffer.from(JSON.stringify({ role: 'admin' })).toString('base64url');
-  const noneToken = `${header}.${payload}.`;
-
-  await assert.rejects(
-    () => verifyToken(noneToken, 'any-key'),
-    /missing or prohibited signature algorithm/i
-  );
-});
-
 test('verifyToken enforces token expiration (exp)', async () => {
-  const secret = 'super-secret-jwt-key-minimum-32-characters';
-  const expiredToken = await signToken({ user: 'bob' }, secret, {
-    expiresIn: -10, // already expired 10 seconds ago
+  const expiredToken = await signToken({ user: 'bob' }, TEST_SECRET, {
+    expiresIn: -10,
   });
 
   await assert.rejects(
-    () => verifyToken(expiredToken, secret, { clockTolerance: 0 }),
+    () => verifyToken(expiredToken, TEST_SECRET, { clockTolerance: 0 }),
     /token has expired/i
   );
 });
@@ -116,11 +178,9 @@ test('field-level claims encryption hides sensitive fields and decrypts seamless
     }
   );
 
-  // Raw token must NOT contain the sensitive values
   assert.ok(!token.includes('987-65-4321'));
   assert.ok(!token.includes('alice.private@vault.net'));
 
-  // Verifying with claimEncryptionSecret decrypts them transparently
   const verified = await verifyToken(token, jwtSecret, {
     claimEncryptionSecret: claimEncryptionKey,
   });

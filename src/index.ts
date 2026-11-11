@@ -1,10 +1,11 @@
 /**
  * edge-secure-token: Zero-dependency, WebCrypto-native, timing-safe JWT and token suite.
- * Built for Cloudflare Workers, Edge, and Node.js with field-level claims encryption.
+ * Built for Cloudflare Workers, Edge, and Node.js with field-level claims encryption and revocation.
  */
 
 export * from './base64url.js';
 export * from './crypto.js';
+export * from './revocation.js';
 
 import {
   toBase64Url,
@@ -20,10 +21,13 @@ import {
   encryptClaims,
   decryptClaims,
 } from './crypto.js';
+import { RevocationStore, MemoryRevocationStore } from './revocation.js';
 
 export interface TokenSignOptions {
   /** Signature algorithm. Defaults to 'HS256'. */
   alg?: SupportedAlgorithm;
+  /** Key ID (kid) header parameter. Must be alphanumeric (plus hyphen/underscore). */
+  kid?: string;
   /** Token lifetime in seconds (sets exp claim). */
   expiresIn?: number;
   /** Issuer claim (iss). */
@@ -32,6 +36,8 @@ export interface TokenSignOptions {
   audience?: string | string[];
   /** Subject claim (sub). */
   subject?: string;
+  /** JWT ID (jti) claim. Defaults to cryptographically generated UUID/random ID. */
+  jti?: string;
   /** Specific claims to encrypt with AES-GCM for field-level privacy. */
   encryptClaims?: string[];
   /** Secret used to encrypt specific claims. */
@@ -47,8 +53,24 @@ export interface TokenVerifyOptions {
   audience?: string;
   /** Allowed clock drift in seconds. Defaults to 60s. */
   clockTolerance?: number;
+  /** Optional revocation store to check for blacklisted jti tokens. */
+  revocationStore?: RevocationStore;
   /** Secret used to decrypt field-level encrypted claims. */
   claimEncryptionSecret?: string;
+}
+
+export interface TokenPair {
+  accessToken: string;
+  refreshToken: string;
+  jti: string;
+  expiresIn: number;
+}
+
+const KID_REGEX = /^[a-zA-Z0-9_-]{1,64}$/;
+
+function generateSecureId(): string {
+  const bytes = globalThis.crypto.getRandomValues(new Uint8Array(16));
+  return Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
 /**
@@ -60,18 +82,31 @@ export async function signToken(
   options: TokenSignOptions = {}
 ): Promise<string> {
   const alg = options.alg ?? 'HS256';
-  if (alg === ('none' as any)) {
+  const normalizedAlg = String(alg).trim().toLowerCase();
+  if (normalizedAlg === 'none') {
     throw new Error('Algorithm "none" is strictly prohibited');
   }
 
-  const header = {
+  if (options.kid) {
+    if (!KID_REGEX.test(options.kid)) {
+      throw new Error('Invalid Key ID (kid): must be 1-64 alphanumeric, hyphen, or underscore characters');
+    }
+  }
+
+  const header: Record<string, any> = {
     typ: 'JWT',
     alg,
   };
+  if (options.kid) {
+    header.kid = options.kid;
+  }
 
   const nowSec = Math.floor(Date.now() / 1000);
+  const jti = options.jti ?? generateSecureId();
+
   let finalPayload: Record<string, any> = {
     iat: nowSec,
+    jti,
     ...payload,
   };
 
@@ -108,7 +143,7 @@ export async function signToken(
 }
 
 /**
- * Verify and decode a token, verifying signature, expiration, issuer, and audience.
+ * Verify and decode a token, verifying signature, expiration, issuer, audience, and revocation.
  */
 export async function verifyToken<T = Record<string, any>>(
   token: string,
@@ -125,7 +160,7 @@ export async function verifyToken<T = Record<string, any>>(
   }
 
   const [headerB64, payloadB64, signatureB64] = parts;
-  let header: { typ?: string; alg?: string };
+  let header: { typ?: string; alg?: string; kid?: string };
   let payload: Record<string, any>;
   let signature: Uint8Array;
 
@@ -138,9 +173,19 @@ export async function verifyToken<T = Record<string, any>>(
   }
 
   const alg = header.alg as SupportedAlgorithm;
-  if (!alg || (alg as string) === 'none') {
-    throw new Error('Missing or prohibited signature algorithm');
+  if (!alg) {
+    throw new Error('Missing signature algorithm in token header');
   }
+
+  const normalizedAlg = String(alg).trim().toLowerCase();
+  if (normalizedAlg === 'none') {
+    throw new Error('Prohibited signature algorithm: "none"');
+  }
+
+  if (header.kid && !KID_REGEX.test(header.kid)) {
+    throw new Error('Malicious Key ID (kid) detected');
+  }
+
   if (options.algorithm && options.algorithm !== alg) {
     throw new Error(`Algorithm mismatch: expected ${options.algorithm}, got ${alg}`);
   }
@@ -176,10 +221,103 @@ export async function verifyToken<T = Record<string, any>>(
     }
   }
 
+  // Check revocation store
+  if (options.revocationStore && payload.jti) {
+    const isRevoked = await options.revocationStore.isRevoked(payload.jti);
+    if (isRevoked) {
+      throw new Error('Token has been revoked');
+    }
+  }
+
   // Decrypt field-level encrypted claims if present
   if (options.claimEncryptionSecret && Array.isArray(payload._enc)) {
     payload = await decryptClaims(payload, options.claimEncryptionSecret);
   }
 
   return payload as T;
+}
+
+/**
+ * Issue a dual Access Token (short-lived) + Refresh Token (long-lived, one-time) pair.
+ */
+export async function issueTokenPair(
+  payload: Record<string, any>,
+  key: string | CryptoKey,
+  options: {
+    accessTtl?: number;
+    refreshTtl?: number;
+    issuer?: string;
+    audience?: string;
+  } = {}
+): Promise<TokenPair> {
+  const accessTtl = options.accessTtl ?? 900; // 15 mins
+  const refreshTtl = options.refreshTtl ?? 604800; // 7 days
+
+  const jti = generateSecureId();
+
+  const accessToken = await signToken(
+    { ...payload, token_type: 'access' },
+    key,
+    {
+      expiresIn: accessTtl,
+      issuer: options.issuer,
+      audience: options.audience,
+      jti,
+    }
+  );
+
+  const refreshToken = await signToken(
+    { ...payload, token_type: 'refresh' },
+    key,
+    {
+      expiresIn: refreshTtl,
+      issuer: options.issuer,
+      audience: options.audience,
+      jti: `rf_${jti}`,
+    }
+  );
+
+  return {
+    accessToken,
+    refreshToken,
+    jti,
+    expiresIn: accessTtl,
+  };
+}
+
+/**
+ * Rotate an existing token pair using a valid refresh token.
+ * Prevents replay attacks by immediately revoking the used refresh token JTI.
+ */
+export async function rotateTokenPair(
+  oldRefreshToken: string,
+  key: string | CryptoKey,
+  revocationStore: RevocationStore,
+  options: {
+    accessTtl?: number;
+    refreshTtl?: number;
+    issuer?: string;
+    audience?: string;
+  } = {}
+): Promise<TokenPair> {
+  const verified = await verifyToken<{ jti: string; token_type: string; exp: number }>(
+    oldRefreshToken,
+    key,
+    {
+      issuer: options.issuer,
+      audience: options.audience,
+      revocationStore,
+    }
+  );
+
+  if (verified.token_type !== 'refresh') {
+    throw new Error('Invalid token type; expected refresh token');
+  }
+
+  // Revoke the old refresh token JTI immediately to prevent replay attacks
+  await revocationStore.revoke(verified.jti, verified.exp);
+
+  // Issue new pair
+  const { jti, token_type, exp, iat, ...userClaims } = verified as any;
+  return issueTokenPair(userClaims, key, options);
 }
