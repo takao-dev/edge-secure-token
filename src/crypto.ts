@@ -1,17 +1,8 @@
 import { toBase64Url, fromBase64Url, utf8Encode, utf8Decode, timingSafeEqual } from './base64url.js';
 
 export function getWebCrypto(): Crypto {
-  if (typeof globalThis.crypto !== 'undefined' && globalThis.crypto.subtle) {
+  if (typeof globalThis.crypto !== 'undefined' && globalThis.crypto?.subtle) {
     return globalThis.crypto;
-  }
-  try {
-    const g = globalThis as any;
-    const nodeCrypto = g.crypto || (typeof g.process !== 'undefined' && g.process?.versions?.node ? (eval('require')('node:crypto') as any).webcrypto : undefined);
-    if (nodeCrypto?.subtle) {
-      return nodeCrypto as Crypto;
-    }
-  } catch {
-    // ignore
   }
   throw new Error('WebCrypto SubtleCrypto is not available in this environment');
 }

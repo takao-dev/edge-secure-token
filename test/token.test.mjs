@@ -16,6 +16,8 @@ import {
   importSignKey,
   signData,
   decryptClaims,
+  getWebCrypto,
+  verifyData,
 } from '../dist/index.js';
 
 const TEST_SECRET = 'super-secret-jwt-key-minimum-32-characters';
@@ -380,5 +382,45 @@ test('multi-algorithm support: ES384, ES512, and Ed25519', async () => {
     assert.equal(verifiedEd.user, 'ed_user');
   } catch {
     // runtime curve support fallback
+  }
+});
+
+test('signToken prohibits alg none and verifyToken rejects malicious kid', async () => {
+  // signToken alg none
+  await assert.rejects(
+    () => signToken({ user: 'none' }, TEST_SECRET, { alg: 'none' }),
+    /Algorithm "none" is strictly prohibited/i
+  );
+
+  // verifyToken header with path traversal kid
+  const badKidHeader = Buffer.from(JSON.stringify({ typ: 'JWT', alg: 'HS256', kid: '../traversal' })).toString('base64url');
+  const payload = Buffer.from(JSON.stringify({ user: 'bad_kid', iat: Math.floor(Date.now() / 1000) })).toString('base64url');
+  const fakeToken = `${badKidHeader}.${payload}.fake_signature`;
+  await assert.rejects(
+    () => verifyToken(fakeToken, TEST_SECRET),
+    /Malicious Key ID \(kid\) detected/i
+  );
+});
+
+test('decryptClaims bypasses unencrypted payloads and verifyData returns false on unsupported alg', async () => {
+  // decryptClaims with no _enc
+  const rawPayload = { normalKey: 'plainValue' };
+  const res = await decryptClaims(rawPayload, TEST_SECRET);
+  assert.deepEqual(res, rawPayload);
+
+  // verifyData with unsupported alg
+  const dummyKey = await importSignKey('HS256', TEST_SECRET);
+  const verifyRes = await verifyData('UNSUPPORTED_ALG', dummyKey, new Uint8Array(32), new Uint8Array(10));
+  assert.equal(verifyRes, false);
+
+  // getWebCrypto throws when crypto is unavailable
+  const originalCrypto = Object.getOwnPropertyDescriptor(globalThis, 'crypto');
+  try {
+    Object.defineProperty(globalThis, 'crypto', { configurable: true, value: undefined });
+    assert.throws(() => getWebCrypto(), /WebCrypto SubtleCrypto is not available/i);
+  } finally {
+    if (originalCrypto) {
+      Object.defineProperty(globalThis, 'crypto', originalCrypto);
+    }
   }
 });
