@@ -20,8 +20,9 @@ import {
   verifyData,
   encryptClaims,
   decryptClaims,
+  getWebCrypto,
 } from './crypto.js';
-import { RevocationStore, MemoryRevocationStore } from './revocation.js';
+import type { RevocationStore } from './revocation.js';
 
 export interface TokenSignOptions {
   /** Signature algorithm. Defaults to 'HS256'. */
@@ -69,7 +70,7 @@ export interface TokenPair {
 const KID_REGEX = /^[a-zA-Z0-9_-]{1,64}$/;
 
 function generateSecureId(): string {
-  const bytes = globalThis.crypto.getRandomValues(new Uint8Array(16));
+  const bytes = getWebCrypto().getRandomValues(new Uint8Array(16));
   return Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
