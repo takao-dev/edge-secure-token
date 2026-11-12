@@ -3,7 +3,12 @@
 Zero-dependency, timing-safe WebCrypto JWT suite for Cloudflare Workers, Edge, and Node.js with native field-level claims encryption.
 
 [![npm version](https://img.shields.io/npm/v/edge-secure-token.svg)](https://www.npmjs.com/package/edge-secure-token)
+[![CI](https://github.com/takao-dev/edge-secure-token/actions/workflows/ci.yml/badge.svg)](https://github.com/takao-dev/edge-secure-token/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/takao-dev/edge-secure-token/branch/main/graph/badge.svg)](https://codecov.io/gh/takao-dev/edge-secure-token)
+[![CodeQL](https://github.com/takao-dev/edge-secure-token/actions/workflows/codeql.yml/badge.svg)](https://github.com/takao-dev/edge-secure-token/actions/workflows/codeql.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen.svg)]()
+[![TypeScript](https://img.shields.io/badge/TypeScript-Ready-blue.svg)]()
 
 ---
 
