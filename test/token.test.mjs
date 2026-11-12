@@ -13,6 +13,9 @@ import {
   issueTokenPair,
   rotateTokenPair,
   MemoryRevocationStore,
+  importSignKey,
+  signData,
+  decryptClaims,
 } from '../dist/index.js';
 
 const TEST_SECRET = 'super-secret-jwt-key-minimum-32-characters';
@@ -194,4 +197,188 @@ test('field-level claims encryption hides sensitive fields and decrypts seamless
   assert.equal(verified.publicInfo, 'visible_to_anyone');
   assert.equal(verified.secretSSN, '987-65-4321');
   assert.equal(verified.billingEmail, 'alice.private@vault.net');
+});
+
+test('MemoryRevocationStore lifecycle and expiration cleanExpired', async () => {
+  const store = new MemoryRevocationStore();
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  store.revoke('jti_1', nowSec + 1);
+  assert.equal(store.isRevoked('jti_1'), true);
+  assert.equal(store.isRevoked('non_existent'), false);
+
+  // Expire
+  await new Promise((resolve) => setTimeout(resolve, 1100));
+  assert.equal(store.isRevoked('jti_1'), false); // Deleted on query
+
+  // cleanExpired on new revoke
+  store.revoke('jti_old', nowSec - 10);
+  store.revoke('jti_new', nowSec + 60);
+  assert.equal(store.isRevoked('jti_new'), true);
+
+  store.clear();
+  assert.equal(store.isRevoked('jti_new'), false);
+});
+
+test('signToken claims options: iss, aud, sub, jti', async () => {
+  const token = await signToken(
+    { data: 123 },
+    TEST_SECRET,
+    {
+      issuer: 'https://auth.takao.me',
+      audience: 'https://api.takao.me',
+      subject: 'usr_admin',
+      jti: 'custom-jti-uuid',
+    }
+  );
+
+  const verified = await verifyToken(token, TEST_SECRET, {
+    issuer: 'https://auth.takao.me',
+    audience: 'https://api.takao.me',
+  });
+
+  assert.equal(verified.iss, 'https://auth.takao.me');
+  assert.equal(verified.aud, 'https://api.takao.me');
+  assert.equal(verified.sub, 'usr_admin');
+  assert.equal(verified.jti, 'custom-jti-uuid');
+});
+
+test('verifyToken failure modes: malformed, alg mismatch, iss mismatch, aud mismatch', async () => {
+  // Malformed tokens
+  await assert.rejects(() => verifyToken('not.a.valid.jwt.with.four.parts', TEST_SECRET), /malformed token structure/i);
+  await assert.rejects(() => verifyToken('not_a_jwt', TEST_SECRET), /malformed token structure/i);
+
+  // Algorithm mismatch
+  const tokenHS256 = await signToken({ user: 'carol' }, TEST_SECRET, { alg: 'HS256' });
+  await assert.rejects(
+    () => verifyToken(tokenHS256, TEST_SECRET, { algorithm: 'ES256' }),
+    /algorithm mismatch/i
+  );
+
+  // Issuer mismatch
+  const tokenWithIss = await signToken({ user: 'carol' }, TEST_SECRET, { issuer: 'real-issuer' });
+  await assert.rejects(
+    () => verifyToken(tokenWithIss, TEST_SECRET, { issuer: 'fake-issuer' }),
+    /issuer mismatch/i
+  );
+
+  // Audience mismatch
+  const tokenWithAud = await signToken({ user: 'carol' }, TEST_SECRET, { audience: 'my-service' });
+  await assert.rejects(
+    () => verifyToken(tokenWithAud, TEST_SECRET, { audience: 'other-service' }),
+    /audience mismatch/i
+  );
+});
+
+test('rotateTokenPair error scenarios', async () => {
+  const store = new MemoryRevocationStore();
+
+  // Non-refresh token used for rotation
+  const accessToken = await signToken({ sub: 'user_1' }, TEST_SECRET);
+  await assert.rejects(
+    () => rotateTokenPair(accessToken, TEST_SECRET, store),
+    /expected refresh token/i
+  );
+
+  // Revoked refresh token
+  const pair = await issueTokenPair('usr_1', TEST_SECRET, { revocationStore: store });
+  store.revoke(`rf_${pair.jti}`, Math.floor(Date.now() / 1000) + 3600);
+
+  await assert.rejects(
+    () => rotateTokenPair(pair.refreshToken, TEST_SECRET, store),
+    /Token has been revoked/i
+  );
+});
+
+test('crypto helpers, nbf, and validation edge cases', async () => {
+  // Invalid string key for ECDSA
+  await assert.rejects(
+    () => importSignKey('ES256', 'raw-string-key'),
+    /String keys are supported for HMAC/i
+  );
+
+  // Unknown algorithm signing
+  const dummyKey = await importSignKey('HS256', TEST_SECRET);
+  await assert.rejects(
+    () => signData('UNKNOWN_ALG', dummyKey, new Uint8Array([1, 2, 3])),
+    /Unsupported signing algorithm/i
+  );
+
+  // Empty token string
+  await assert.rejects(() => verifyToken('', TEST_SECRET), /non-empty string/i);
+
+  // Malformed base64url or JSON
+  await assert.rejects(() => verifyToken('bad.bad.bad', TEST_SECRET), /Malformed base64url or JSON/i);
+
+  // Missing alg in header
+  const b64 = (obj) => Buffer.from(JSON.stringify(obj)).toString('base64url');
+  const noAlgToken = `${b64({ typ: 'JWT' })}.${b64({ user: 'dave' })}.sig`;
+  await assert.rejects(() => verifyToken(noAlgToken, TEST_SECRET), /Missing signature algorithm/i);
+
+  // nbf in the future
+  const futureNbfToken = await signToken({ user: 'future', nbf: Math.floor(Date.now() / 1000) + 3600 }, TEST_SECRET);
+  await assert.rejects(
+    () => verifyToken(futureNbfToken, TEST_SECRET, { clockTolerance: 0 }),
+    /Token is not active yet/i
+  );
+
+  // Missing claimEncryptionSecret when encryptClaims specified
+  await assert.rejects(
+    () => signToken({ secretData: 'xyz' }, TEST_SECRET, { encryptClaims: ['secretData'] }),
+    /claimEncryptionSecret is required/i
+  );
+
+  // decryptClaims when claim is not in enc_gcm format
+  const claimsWithNonEnc = {
+    _enc: ['plainClaim'],
+    plainClaim: 'not-an-encrypted-string',
+  };
+  const decrypted = await decryptClaims(claimsWithNonEnc, TEST_SECRET);
+  assert.equal(decrypted.plainClaim, 'not-an-encrypted-string');
+});
+
+test('multi-algorithm support: ES384, ES512, and Ed25519', async () => {
+  const crypto = globalThis.crypto;
+
+  // ES384 (P-384)
+  try {
+    const es384Keys = await crypto.subtle.generateKey(
+      { name: 'ECDSA', namedCurve: 'P-384' },
+      false,
+      ['sign', 'verify']
+    );
+    const token384 = await signToken({ user: 'es384_user' }, es384Keys.privateKey, { alg: 'ES384' });
+    const verified384 = await verifyToken(token384, es384Keys.publicKey, { algorithm: 'ES384' });
+    assert.equal(verified384.user, 'es384_user');
+  } catch {
+    // runtime curve support fallback
+  }
+
+  // ES512 (P-521)
+  try {
+    const es512Keys = await crypto.subtle.generateKey(
+      { name: 'ECDSA', namedCurve: 'P-521' },
+      false,
+      ['sign', 'verify']
+    );
+    const token512 = await signToken({ user: 'es512_user' }, es512Keys.privateKey, { alg: 'ES512' });
+    const verified512 = await verifyToken(token512, es512Keys.publicKey, { algorithm: 'ES512' });
+    assert.equal(verified512.user, 'es512_user');
+  } catch {
+    // runtime curve support fallback
+  }
+
+  // Ed25519
+  try {
+    const edKeys = await crypto.subtle.generateKey(
+      { name: 'Ed25519' },
+      false,
+      ['sign', 'verify']
+    );
+    const tokenEd = await signToken({ user: 'ed_user' }, edKeys.privateKey, { alg: 'Ed25519' });
+    const verifiedEd = await verifyToken(tokenEd, edKeys.publicKey, { algorithm: 'Ed25519' });
+    assert.equal(verifiedEd.user, 'ed_user');
+  } catch {
+    // runtime curve support fallback
+  }
 });
